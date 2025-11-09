@@ -6,7 +6,8 @@ import queue
 import itertools
 import string
 import math
-import traceback # Import traceback for detailed error logging
+import traceback
+import zlib # Import zlib to catch its specific error
 
 # --- FIX 5: Password Generator Architecture ---
 
@@ -102,43 +103,41 @@ def get_file_path(prompt, file_type):
         print(f"Error: {file_type} file not found at that location. Please try again.")
 
 
-# --- CRITICAL FIX: Robust Worker Function ---
+# --- FINAL FIX: Robust Worker Function that ignores expected errors ---
 def worker(zip_path, work_queue, result_queue, stop_event, progress_queue):
     """
     Generic worker that gets passwords from a queue and tests them.
     Opens the ZIP file ONCE per process for efficiency and stability.
     """
     try:
-        # Open the ZIP file once when the worker starts
         with pyzipper.AESZipFile(zip_path) as zf:
             while not stop_event.is_set():
                 try:
                     password = work_queue.get(timeout=0.1)
                 except queue.Empty:
-                    continue # No work available, check stop_event and loop again
+                    continue
 
-                # The feeder process puts 'None' when done
                 if password is None:
                     break
 
                 try:
                     zf.pwd = password.encode('utf-8')
-                    # testzip() is the most reliable verification method
                     if zf.testzip() is None:
                         result_queue.put(password)
                         stop_event.set()
                         return
-                except (RuntimeError, pyzipper.BadZipFile):
-                    # This is expected for wrong passwords, just continue
+                # FINAL FIX: Catch and ignore the specific, expected errors for wrong passwords.
+                except (RuntimeError, pyzipper.BadZipFile, zlib.error):
+                    # These are expected when the password is wrong, so we just continue.
                     pass
                 
                 progress_queue.put(1)
     except Exception as e:
-        # Catch any other unexpected error (e.g., file not found, pyzipper bug)
+        # Catch any other TRULY unexpected error
         print(f"\n[CRITICAL ERROR] A worker process has crashed!")
         print(f"Error: {e}")
-        traceback.print_exc() # Print the full traceback for debugging
-        stop_event.set() # Signal all processes to stop
+        traceback.print_exc()
+        stop_event.set()
 
 
 def feeder_process(password_generator, work_queue, stop_event):
@@ -198,7 +197,6 @@ def crack_zip(zip_path, password_generator, output_file='found_password.txt'):
 
     # --- Main process loop for monitoring and feedback ---
     total_tried = 0
-    # Loop until the stop event is set (by success, completion, or error)
     while not stop_event.is_set():
         try:
             attempts = progress_queue.get(timeout=0.5)
@@ -206,7 +204,6 @@ def crack_zip(zip_path, password_generator, output_file='found_password.txt'):
         except queue.Empty:
             pass
 
-        # Real-time feedback to the console
         current_time = time.time()
         elapsed_time = current_time - start_time
         progress_percent = (total_tried / total_passwords) * 100 if total_passwords > 0 else 0
