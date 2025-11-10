@@ -6,6 +6,8 @@ import queue
 import itertools
 import string
 import math
+import traceback
+import zlib # Import zlib to catch its specific error
 
 # --- FIX 5: Password Generator Architecture ---
 
@@ -100,40 +102,43 @@ def get_file_path(prompt, file_type):
             return path
         print(f"Error: {file_type} file not found at that location. Please try again.")
 
-# FIX 4: Improved password verification to prevent false negatives.
-def verify_password(zip_path, password):
-    """
-    Verify a password by testing the integrity of all files in the ZIP.
-    Returns True if password is correct, False otherwise.
-    """
-    try:
-        with pyzipper.AESZipFile(zip_path) as zf:
-            zf.pwd = password.encode('utf-8')
-            if zf.testzip() is None:
-                return True
-            else:
-                return False
-    except (RuntimeError, pyzipper.BadZipFile, Exception):
-        return False
 
+# --- FINAL FIX: Robust Worker Function that ignores expected errors ---
 def worker(zip_path, work_queue, result_queue, stop_event, progress_queue):
     """
     Generic worker that gets passwords from a queue and tests them.
+    Opens the ZIP file ONCE per process for efficiency and stability.
     """
-    while not stop_event.is_set():
-        try:
-            # Get password from the work queue with a timeout
-            password = work_queue.get(timeout=0.1)
-        except queue.Empty:
-            continue # No work available, check stop_event and loop again
+    try:
+        with pyzipper.AESZipFile(zip_path) as zf:
+            while not stop_event.is_set():
+                try:
+                    password = work_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
 
-        if verify_password(zip_path, password):
-            result_queue.put(password)
-            stop_event.set()
-            return
-        
-        # Report one attempt made
-        progress_queue.put(1)
+                if password is None:
+                    break
+
+                try:
+                    zf.pwd = password.encode('utf-8')
+                    if zf.testzip() is None:
+                        result_queue.put(password)
+                        stop_event.set()
+                        return
+                # FINAL FIX: Catch and ignore the specific, expected errors for wrong passwords.
+                except (RuntimeError, pyzipper.BadZipFile, zlib.error):
+                    # These are expected when the password is wrong, so we just continue.
+                    pass
+                
+                progress_queue.put(1)
+    except Exception as e:
+        # Catch any other TRULY unexpected error
+        print(f"\n[CRITICAL ERROR] A worker process has crashed!")
+        print(f"Error: {e}")
+        traceback.print_exc()
+        stop_event.set()
+
 
 def feeder_process(password_generator, work_queue, stop_event):
     """
@@ -145,11 +150,14 @@ def feeder_process(password_generator, work_queue, stop_event):
                 break
             work_queue.put(password)
     except Exception as e:
-        print(f"Error in feeder process: {e}")
+        print(f"\n[CRITICAL ERROR] The feeder process has crashed!")
+        print(f"Error: {e}")
+        traceback.print_exc()
         stop_event.set()
     finally:
-        # Signal that feeding is complete
-        work_queue.put(None)
+        # Signal that feeding is complete by putting a 'None' sentinel
+        for _ in range(multiprocessing.cpu_count()): # Ensure all workers get the signal
+             work_queue.put(None)
 
 
 def crack_zip(zip_path, password_generator, output_file='found_password.txt'):
@@ -165,7 +173,7 @@ def crack_zip(zip_path, password_generator, output_file='found_password.txt'):
     print(f"Starting parallel cracking with {num_cores} cores")
     
     # Create multiprocessing objects
-    work_queue = multiprocessing.Queue(maxsize=num_cores * 100) # Bounded queue to prevent memory bloat
+    work_queue = multiprocessing.Queue(maxsize=num_cores * 100)
     result_queue = multiprocessing.Queue()
     progress_queue = multiprocessing.Queue()
     stop_event = multiprocessing.Event()
@@ -189,20 +197,13 @@ def crack_zip(zip_path, password_generator, output_file='found_password.txt'):
 
     # --- Main process loop for monitoring and feedback ---
     total_tried = 0
-    workers_active = True
-    while workers_active and not stop_event.is_set():
+    while not stop_event.is_set():
         try:
-            # Get progress from workers
             attempts = progress_queue.get(timeout=0.5)
             total_tried += attempts
         except queue.Empty:
             pass
 
-        # Check if all workers are done (work_queue is empty and all items processed)
-        if work_queue.empty() and all(not p.is_alive() for p in processes):
-            workers_active = False
-
-        # FIX 3: Real-time feedback to the console
         current_time = time.time()
         elapsed_time = current_time - start_time
         progress_percent = (total_tried / total_passwords) * 100 if total_passwords > 0 else 0
@@ -217,11 +218,11 @@ def crack_zip(zip_path, password_generator, output_file='found_password.txt'):
         print(f"\rProgress: {total_tried}/{total_passwords} ({progress_percent:.2f}%) | "
               f"Rate: {rate:.0f} p/s | ETA: {eta}", end="", flush=True)
 
-    # Stop all processes
+    # Stop all processes gracefully
     stop_event.set()
-    feeder.join()
+    feeder.join(timeout=1)
     for p in processes:
-        p.join()
+        p.join(timeout=1)
 
     print() # Newline after progress bar
 
@@ -238,7 +239,7 @@ def crack_zip(zip_path, password_generator, output_file='found_password.txt'):
         return True
     else:
         duration = time.time() - start_time
-        print(f"\nPassword not found.")
+        print(f"\nPassword not found or an error occurred.")
         print(f"Time elapsed: {duration:.2f} seconds")
         return False
 
@@ -248,7 +249,6 @@ if __name__ == "__main__":
     
     zip_file = get_file_path("Enter the full path to your encrypted ZIP file: ", "ZIP")
     
-    # --- FIX 5: User choice for attack type ---
     attack_type = input("Choose attack type (1 for Dictionary, 2 for Brute-Force): ").strip()
     
     if attack_type == '1':
@@ -258,15 +258,26 @@ if __name__ == "__main__":
         
     elif attack_type == '2':
         print("\n--- Brute-Force Configuration ---")
-        charset_choice = input("Choose charset (1: lowercase, 2: uppercase, 3: digits, 4: symbols, 5: all): ").strip()
-        charsets = {
-            '1': string.ascii_lowercase,
-            '2': string.ascii_uppercase,
-            '3': string.digits,
-            '4': string.punctuation,
-            '5': string.ascii_letters + string.digits + string.punctuation
-        }
-        charset = charsets.get(charset_choice, string.ascii_lowercase)
+        charset_choice = input("Choose charset (1: lowercase, 2: uppercase, 3: digits, 4: symbols, 5: all, 6: manual): ").strip()
+        
+        if charset_choice == '1':
+            charset = string.ascii_lowercase
+        elif charset_choice == '2':
+            charset = string.ascii_uppercase
+        elif charset_choice == '3':
+            charset = string.digits
+        elif charset_choice == '4':
+            charset = string.punctuation
+        elif charset_choice == '5':
+            charset = string.ascii_letters + string.digits + string.punctuation
+        elif charset_choice == '6':
+            charset = input("Enter your custom charset string: ").strip()
+            while not charset:
+                print("Error: Charset cannot be empty.")
+                charset = input("Enter your custom charset string: ").strip()
+        else:
+            print("Invalid choice. Defaulting to lowercase.")
+            charset = string.ascii_lowercase
         
         min_len = int(input("Enter minimum password length: "))
         max_len = int(input("Enter maximum password length: "))
